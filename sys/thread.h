@@ -648,4 +648,10 @@ extern void rwlock_release(struct rwlock * rwlk);
 //
 // See also: rwlock_acquire().
 
+
+extern void mlfq_boost_priority(void); 
+extern void display_thread_info(void); 
+
+// This function sets the priority of all threads to the highest priority except the idle thread 
+
 #endif // _THREAD_H_

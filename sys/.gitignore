@@ -1,0 +1,6 @@
+*.o
+*.raw
+*.elf 
+dev/*.o
+../util/fs/*.txt
+*.txt

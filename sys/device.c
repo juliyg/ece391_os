@@ -39,7 +39,6 @@ struct device_record {
 };
 
 // devfs listing io object
-
 struct devfs_lsio {
     struct io base;
     const struct device_record * next;
@@ -58,6 +57,7 @@ struct device_record * find_device(const char * name);
 
 char devmgr_initialized = 0;
 
+// the devfs file system only supports openfile of the filesystem generic type
 static struct filesystem devfs = {
     .implname = "devfs",
     .openfile = &devfs_open_file
@@ -68,6 +68,7 @@ static struct filesystem devfs = {
 
 static struct device_record * devlist;
 
+// dispatch table for the listing generic type of the devfs filesystem 
 static const struct iointf devfs_lsio_intf = {
     .implname = "devfs_lsio",
     .reclaim = (void(*)(struct io*))&kfree,
@@ -81,6 +82,11 @@ void devmgr_init(void) {
     trace("%s()", __func__);
     devmgr_initialized = 1;
 }
+
+// Justin's notes
+// register_device appends a device to the start of the device registry linked list 
+// DOES not "start" the device, but provides the callback to the open_device() which starts the device 
+// register_device is called in the attach phase where the device drivers resources are intialized  
 
 int register_device (
     const char * name,

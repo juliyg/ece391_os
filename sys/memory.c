@@ -250,13 +250,13 @@ void memory_init (
     // permissions based on kernel image region.
     //
     // This also means that the kernel must be smaller than 4 MB
-
+    
     main_pt1_0x80000[VPN1(RAM_START_PMA)] = ptab_pte(main_pt0_0x80000, PTE_G);
     main_pt1_0x80000[VPN1(RAM_START_PMA + MEGA_SIZE)] = ptab_pte(main_pt0_0x80001, PTE_G);
 
     //Map the reserved region before the kernel
     for (pp = RAM_START; pp < text_start; pp+=PAGE_SIZE) {
-        main_pt0_0x80000[VPN0((uintptr_t)pp)] = leaf_pte(pp, PTE_R);
+        main_pt0_0x80000[VPN0((uintptr_t)pp)] = leaf_pte(pp, PTE_R | PTE_G);
     }
 
     for (pp = text_start; pp < text_end; pp += PAGE_SIZE) {
@@ -319,6 +319,9 @@ void memory_init (
 
     // YOUR CODE HERE
     // Initialize free chunk list
+    free_chunk_list = heap_end;
+    free_chunk_list->pagecnt = ((RAM_END - MEGA_SIZE) - heap_end) / PAGE_SIZE;
+    free_chunk_list->next = NULL;
     
     kprintfluffy(40, &art, "Free Chunk List Initialized!");
     kprintfluffy(40, &art, "%d Free Pages.", free_phys_page_count());
@@ -339,27 +342,178 @@ void memory_init (
 
 mtag_t active_mspace(void) {
     // YOUR CODE HERE
-    return 0;
+    return csrr_satp();
+    
 }
 
 mtag_t switch_mspace(mtag_t mtag) {
     // YOUR CODE HERE
+    unsigned long prev_mspace = csrr_satp();
+    csrw_satp(mtag);
+    sfence_vma();
+    return prev_mspace;
+    
+}
+int clone_walk_helper(struct pte* root, struct pte* res){
+
+    for (int i = 0; i < PTE_CNT; i++){
+
+        if (!PTE_VALID(root[i])){
+            res[i] = null_pte();
+            continue;
+        }
+
+        if (PTE_GLOBAL(root[i])){
+            res[i] = root[i];
+            continue;
+        }
+
+        if (PTE_LEAF(root[i])){
+
+            void * pp = alloc_phys_page();
+            if (pp == NULL){
+                return -EFAULT;
+            }
+
+            void * copy_addr = pageptr(root[i].ppn);
+            for (int j = 0; j < PAGE_SIZE; j++){
+                ((char *)pp)[j] = ((char *)copy_addr)[j];
+            }
+            res[i] = leaf_pte(pp, root[i].flags & (PTE_R | PTE_W | PTE_X | PTE_U | PTE_G));
+            continue;
+        }
+        
+        struct pte* child = alloc_phys_page();
+        if (child == NULL){
+            return -EFAULT;
+        }
+        int call = clone_walk_helper(pageptr(root[i].ppn), child);
+        if (call < 0){
+            free_phys_page(child);
+            return call;
+        }
+        res[i] = ptab_pte(child, root[i].flags & PTE_G);
+
+    }
     return 0;
 }
 
 mtag_t clone_active_mspace(void) {
     // YOUR CODE HERE
+
+    struct pte* clone = alloc_phys_page();
+
+    if (clone == NULL){
+        return 0;
+    }
+
+    if (clone_walk_helper(active_space_ptab(), clone) < 0) {
+        free_phys_page(clone);
+        return 0;
+    }
+    return ptab_to_mtag(clone, 0);
+}
+
+int reset_walk_helper(struct pte* root){
+
+    for (int i = 0; i < PTE_CNT; i++){
+
+        if (!PTE_VALID(root[i])) {
+            continue;
+        }
+
+        if (PTE_LEAF(root[i]) && PTE_GLOBAL(root[i])){
+            continue;
+        }
+
+        if (PTE_LEAF(root[i])){
+            uint64_t leaf_ppn = root[i].ppn;
+            root[i] = null_pte();
+            free_phys_page(pageptr(leaf_ppn));
+            continue;
+        }
+        
+        struct pte* child = pageptr(root[i].ppn);
+        if (child == NULL){
+            return -EFAULT;
+        }
+        int call = reset_walk_helper(child);
+        if (call < 0){
+            return call;
+        }  
+
+        int free_intermediate = 1;
+        for (int j = 0; j < PTE_CNT; j++){
+            if (PTE_VALID(child[j])) {
+                free_intermediate = 0;
+                break;
+            }
+        }
+        if (free_intermediate && !PTE_GLOBAL(root[i])) {
+            uint64_t intermediate_ppn = root[i].ppn;
+            root[i] = null_pte();
+            free_phys_page(pageptr(intermediate_ppn));
+        }
+
+    }
     return 0;
 }
 
 void reset_active_mspace(void) {
-    // YOUR CODE HERE
-    return;
+    
+    reset_walk_helper(active_space_ptab());
+    sfence_vma();
 }
+
+int discard_walk_helper(struct pte* root){
+
+    for (int i = 0; i < PTE_CNT; i++){
+
+        if (!PTE_VALID(root[i]) || PTE_GLOBAL(root[i])){
+            continue;
+        }
+
+        if (PTE_LEAF(root[i])){
+            uint64_t leaf_ppn = root[i].ppn;
+            root[i] = null_pte();
+            free_phys_page(pageptr(leaf_ppn));
+            continue;
+        }
+        
+        struct pte* child = pageptr(root[i].ppn);
+        if (child == NULL){
+            return -EFAULT;
+        }
+        int call = discard_walk_helper(child);
+        if (call < 0){
+            return call;
+        }  
+
+        uint64_t intermediate_ppn = root[i].ppn;
+        root[i] = null_pte();
+        free_phys_page(pageptr(intermediate_ppn));
+        
+
+    }
+    return 0;
+}
+
 
 mtag_t discard_active_mspace(void) {
     // YOUR CODE HERE
-    return 0;
+
+    struct pte * discard_root = active_space_ptab();
+    if (active_space_mtag() == main_mtag){
+        return main_mtag;
+    }
+
+    switch_mspace(main_mtag);
+
+    if (discard_walk_helper(discard_root) < 0){
+        panic("discard failed");
+    }
+    free_phys_page(discard_root);
+    return active_space_mtag();
 }
 
 // The map_page() function maps a single page into the active address space at
@@ -374,67 +528,362 @@ mtag_t discard_active_mspace(void) {
 
 void * map_page(uintptr_t vma, void * pp, int rwxug_flags) {
     // YOUR CODE HERE
-    return NULL;
+    struct pte* pt2 = active_space_ptab();
+    if (!PTE_VALID(pt2[VPN2(vma)])) {
+        void * pma = alloc_phys_page();
+        if(pma == NULL){
+            return NULL;
+        }
+        memset(pma, 0, PAGE_SIZE);
+        pt2[VPN2(vma)].ppn = pagenum(pma);
+        pt2[VPN2(vma)].flags = PTE_V | (rwxug_flags & PTE_G);
+    }
+    
+    uintptr_t pt1_ppn = pt2[VPN2(vma)].ppn;
+    uintptr_t pt1_pma = pt1_ppn << 12;
+    struct pte* pt1 = (struct pte*)pt1_pma;
+
+    if (!PTE_VALID(pt1[VPN1(vma)])) {
+        void * pma = alloc_phys_page();
+        if (pma == NULL){
+            return NULL;
+        }
+        memset(pma, 0, PAGE_SIZE);
+        pt1[VPN1(vma)].ppn = pagenum(pma);
+        pt1[VPN1(vma)].flags = PTE_V | (rwxug_flags & PTE_G);
+    }
+
+    uintptr_t pt0_ppn = pt1[VPN1(vma)].ppn;
+    uintptr_t pt0_pma = pt0_ppn << 12;
+    struct pte* pt0 = (struct pte*)pt0_pma;
+
+    //implement remapping case if necessary
+
+    pt0[VPN0(vma)].ppn = pagenum(pp);
+    pt0[VPN0(vma)].flags = PTE_V | rwxug_flags;
+    
+    return (void*)vma;
 }
 
 void * map_range(uintptr_t vma, size_t size, void * pp, int rwxug_flags) {
     // YOUR CODE HERE
-    return NULL;
+    for (size_t i = 0; i < size; i+= PAGE_SIZE){
+        if (map_page(vma+i, (uint8_t *)pp+i, rwxug_flags) == NULL){
+            return NULL;
+    }
+    }
+    return (void*)vma;
+
 }
 
 void * alloc_and_map_range(uintptr_t vma, size_t size, int rwxug_flags) {
     // YOUR CODE HERE
-    return NULL;
+
+    void * pp = alloc_phys_pages(CEIL(size, PAGE_SIZE));
+    if (pp == NULL){
+        return NULL;
+    }
+    void * map_res = map_range(vma, size, pp, rwxug_flags);
+    if (map_res == NULL){
+        free_phys_pages(pp, CEIL(size, PAGE_SIZE));
+        return NULL;
+    }
+    return (void*)vma;
 }
 
 void set_range_flags(const void * vp, size_t size, int rwxug_flags) {
     // YOUR CODE HERE
+
+    struct pte * pt2 = active_space_ptab();
+
+    for (uintptr_t i = ROUND_DOWN((uintptr_t)vp, PAGE_SIZE); i < (uintptr_t)vp+size; i+= PAGE_SIZE){
+        
+        if (PTE_VALID(pt2[VPN2(i)])){
+            struct pte * pt1 = pageptr(pt2[VPN2(i)].ppn);
+            if (PTE_VALID(pt1[VPN1(i)])){
+                struct pte * pt0 = pageptr(pt1[VPN1(i)].ppn);
+                if (PTE_VALID(pt0[VPN0(i)])){
+                    pt0[VPN0(i)].flags = PTE_V | rwxug_flags;
+                }
+            }
+        }
+    }
+
+    sfence_vma();
     return;
 }
 
 void unmap_and_free_range(void * vp, size_t size) {
     // YOUR CODE HERE
+    struct pte * pt2 = active_space_ptab();
+
+    for (uintptr_t i = ROUND_DOWN((uintptr_t)vp, PAGE_SIZE); i < ROUND_UP((uintptr_t)vp+size, PAGE_SIZE); i+= PAGE_SIZE){
+        
+        uint8_t clear_pt1 = 1;
+        uint8_t clear_pt2 = 1;
+
+        if (PTE_VALID(pt2[VPN2(i)])){
+            struct pte * pt1 = pageptr(pt2[VPN2(i)].ppn);
+            
+            if (PTE_VALID(pt1[VPN1(i)])){
+                struct pte * pt0 = pageptr(pt1[VPN1(i)].ppn);
+
+                if (PTE_VALID(pt0[VPN0(i)])){
+                    uint64_t leaf_ppn = pt0[VPN0(i)].ppn;
+                    pt0[VPN0(i)] = null_pte();
+                    free_phys_page(pageptr(leaf_ppn));
+
+                    for (uintptr_t j = 0; j < PTE_CNT; j++){
+                        if (PTE_VALID(pt0[j])){
+                            clear_pt1 = 0;
+                            break;
+                        }
+                    }
+                    if (clear_pt1){
+                        uint64_t pt0_ppn = pt1[VPN1(i)].ppn;
+                        pt1[VPN1(i)] = null_pte();
+                        free_phys_page(pageptr(pt0_ppn));
+                    }
+                    for (uintptr_t j = 0; j < PTE_CNT; j++){
+                        if (PTE_VALID(pt1[j])){
+                            clear_pt2 = 0;
+                            break;
+                        }
+                    }
+                    if (clear_pt2){
+                        uint64_t pt1_ppn = pt2[VPN2(i)].ppn;
+                        pt2[VPN2(i)] = null_pte();
+                        free_phys_page(pageptr(pt1_ppn));
+                    }
+                }
+            }
+        }
+    }
+
+    sfence_vma();
     return;
 }
 
+
 int enforce_vptr(const void * vp, size_t size, int rwxug_flags) {
     // YOUR CODE HERE
+
+    if (vp == NULL){
+        return -EFAULT;
+    }
+     
+    struct pte * pt2 = active_space_ptab();
+
+    for (uintptr_t i = ROUND_DOWN((uintptr_t)vp, PAGE_SIZE); i < ROUND_UP((uintptr_t)vp+size, PAGE_SIZE); i+= PAGE_SIZE){
+
+        if (!wellformed(i)){
+            return -EFAULT;
+        }
+        if (i >= UMEM_END_VMA || i < UMEM_START_VMA){
+            return -EFAULT;
+        }
+
+        if (!PTE_VALID(pt2[VPN2(i)])){
+            if (!(rwxug_flags & PTE_X)) {
+                void* alloc_res = alloc_and_map_range(i, PAGE_SIZE, rwxug_flags);
+                if (alloc_res == NULL){
+                    return -EFAULT;
+                }
+            }
+            else{
+                return -EFAULT;
+            }
+            continue;
+        }
+        
+        struct pte * pt1 = pageptr(pt2[VPN2(i)].ppn);
+            
+        if (!PTE_VALID(pt1[VPN1(i)])){
+            if (!(rwxug_flags & PTE_X)) {
+                void* alloc_res = alloc_and_map_range(i, PAGE_SIZE, rwxug_flags);
+                if (alloc_res == NULL){
+                    return -EFAULT;
+                }
+            }
+            else{
+                return -EFAULT;
+            }
+            continue;
+        }
+        struct pte * pt0 = pageptr(pt1[VPN1(i)].ppn);
+                
+        if (!PTE_VALID(pt0[VPN0(i)])){
+            if (!(rwxug_flags & PTE_X)) {
+                void* alloc_res = alloc_and_map_range(i, PAGE_SIZE, rwxug_flags);
+                if (alloc_res == NULL){
+                    return -EFAULT;
+                }
+            }
+            else{
+                return -EFAULT;
+            }
+            continue;
+        }
+        if (((pt0[VPN0(i)].flags & (PTE_R | PTE_W | PTE_U | PTE_G | PTE_X)) & rwxug_flags) != rwxug_flags) {
+            return -EFAULT;
+        }
+        }
+
+    sfence_vma();
     return 0;
 }
 
 int validate_vstr(const char * vs, int rwxug_flags) {
     // YOUR CODE HERE
+
+    //add valid checks?
+
+    if (vs == NULL){
+        return -EFAULT;
+    }
+
+    struct pte * pt2 = active_space_ptab();
+    const char * cur = vs;
+    while (1 == 1){
+
+
+        if (!PTE_VALID(pt2[VPN2((uintptr_t)cur)])){
+            return -EFAULT;
+        }
+        struct pte * pt1 = pageptr(pt2[VPN2((uintptr_t)cur)].ppn);
+        
+        if (!PTE_VALID(pt1[VPN1((uintptr_t)cur)])){
+            return -EFAULT;
+        }
+        struct pte * pt0 = pageptr(pt1[VPN1((uintptr_t)cur)].ppn);
+
+        if (!PTE_VALID(pt0[VPN0((uintptr_t)cur)])){
+            return -EFAULT;
+        }
+
+        if (((pt0[VPN0((uintptr_t)cur)].flags & (PTE_R | PTE_W | PTE_X | PTE_U | PTE_G)) & (rwxug_flags)) != rwxug_flags) {
+            return -EFAULT;
+        }
+
+        if (*((char*)((pt0[VPN0((uintptr_t)cur)].ppn << 12) | ((uintptr_t)cur & 0xFFF))) == '\0'){
+            break;
+        }
+        cur += 1;
+        
+    }
+
     return 0;
 }
 
 void * alloc_phys_page(void) {
     // YOUR CODE HERE
-    return NULL;
+    
+    struct page_chunk * cur = free_chunk_list;
+    struct page_chunk * prev = NULL;
+    struct page_chunk * best_fit = free_chunk_list;
+    unsigned long fit = UINT64_MAX;
+    while (cur != NULL){
+
+        if (cur->pagecnt == 1){
+            void* pp = cur;
+            if (prev != NULL){
+                prev->next = cur->next;
+            }
+            else{
+                free_chunk_list = cur->next;
+            }
+            return pp;
+        }
+        if (cur->pagecnt - 1 < fit){
+            best_fit = cur;
+            fit = cur->pagecnt - 1;
+        }
+
+        prev = cur;
+        cur = cur->next;
+    }
+
+    void* pp = (uint8_t *)best_fit + (best_fit->pagecnt - 1) * PAGE_SIZE;
+    best_fit->pagecnt -= 1;
+    return pp;
 }
 
 void free_phys_page(void * pp) {
     // YOUR CODE HERE
-    return;
+
+    struct page_chunk* cur = pp;
+    cur->pagecnt = 1;
+    cur->next = free_chunk_list;
+    free_chunk_list = cur;
+
 }
 
 void * alloc_phys_pages(unsigned int cnt) {
     // YOUR CODE HERE
-    return NULL;
+
+     struct page_chunk * cur = free_chunk_list;
+    struct page_chunk * prev = NULL;
+    struct page_chunk * best_fit = free_chunk_list;
+    unsigned long fit = UINT64_MAX;
+    while (cur != NULL){
+
+        if (cur->pagecnt == cnt){
+            void* pp = cur;
+            if (prev != NULL){
+                prev->next = cur->next;
+            }
+            else{
+                free_chunk_list = cur->next;
+            }
+            return pp;
+        }
+        if (cur->pagecnt > cnt && cur->pagecnt - cnt < fit){
+            best_fit = cur;
+            fit = cur->pagecnt - cnt;
+        }
+
+        prev = cur;
+        cur = cur->next;
+    }
+
+    void* pp = (uint8_t *)best_fit + (best_fit->pagecnt - cnt) * PAGE_SIZE;
+    best_fit->pagecnt -= cnt;
+    return pp;
 }
 
 void free_phys_pages(void * pp, unsigned int cnt) {
     // YOUR CODE HERE
+    struct page_chunk* cur = pp;
+    cur->pagecnt = cnt;
+    cur->next = free_chunk_list;
+    free_chunk_list = cur;
     return;
 }
 
 unsigned long free_phys_page_count(void) {
     // YOUR CODE HERE
-    return 0;
+    struct page_chunk* cur = free_chunk_list;
+    unsigned long count = 0;
+    while (cur != NULL) {
+        count += cur->pagecnt;
+        cur = cur->next;
+    }
+    return count;
 }
 
 int handle_umode_page_fault(struct trap_frame * tfr, uintptr_t vma) {
     // YOUR CODE HERE
-    return 0;
+    if (vma < UMEM_START_VMA || vma >= UMEM_END_VMA){
+        return 0;
+    }
+
+    vma = ROUND_DOWN(vma, PAGE_SIZE);
+
+    void* vma_res = alloc_and_map_range(vma, PAGE_SIZE, PTE_U | PTE_W | PTE_R);
+    if (vma_res == NULL){
+        return -EFAULT;
+    }
+    return 1;
 }
 
 // INTERNAL FUNCTION DEFINITIONS

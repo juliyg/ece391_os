@@ -92,7 +92,133 @@ _smode_trap_entry:
 
 smode_trap_entry_from_umode:
 
-        # YOUR CODE HERE
+        # If sscratch != 0, fall through to smode_trap_entry_from_umode
+        # sscratch will be set to the stack pointer of the kernel stack, and pointer to trapframe
+        # note this is first setup when the main thread calls process_exec 
+
+        # save general purpose registers to the bottom of the kernel stack (TOS) / trapframe
+
+        sd      a0, A0(sp)
+        sd      a1, A1(sp)
+        sd      a2, A2(sp)
+        sd      a3, A3(sp)
+        sd      a4, A4(sp)
+        sd      a5, A5(sp)
+        sd      a6, A6(sp)
+        sd      a7, A7(sp)
+        sd      t0, T0(sp)
+        sd      t1, T1(sp)
+        sd      t2, T2(sp)
+        sd      t3, T3(sp)
+        sd      t4, T4(sp)
+        sd      t5, T5(sp)
+        sd      t6, T6(sp)
+        sd      s1, S1(sp)
+        sd      s2, S2(sp)
+        sd      s3, S3(sp)
+        sd      s4, S4(sp)
+        sd      s5, S5(sp)
+        sd      s6, S6(sp)
+        sd      s7, S7(sp)
+        sd      s8, S8(sp)
+        sd      s9, S9(sp)
+        sd      s10, S10(sp)
+        sd      s11, S11(sp)
+        sd      ra, RA(sp)
+        sd      fp, FP(sp)
+        sd      gp, GP(sp)
+        sd      tp, TP(sp)        
+
+        # Capture retired instruction counter and save it in trap frame
+        # Counts the number instructions have been executed 
+
+        rdinstret       t6
+        sd              t6, SINSTRET(sp)
+
+        # Save the sepc, the sstatus registers to the stack, and _user_ sp to the stack
+
+        csrr    t6, sstatus 
+        sd      t6, SSTATUS(sp) 
+        csrr    t6, sepc 
+        sd      t6, SEPC(sp) 
+        csrr    t6, sscratch 
+        sd      t6, SP(sp)  # save the user stack pointer 
+
+
+        # Setup fp for the current execution state which points to the top of the current 
+        # stack frame on the kernel stack 
+
+        addi fp, sp, TFRSZ 
+
+        # load tp from the stack anchor since the kernel may need it for syscalls or blocking interrupts etc 
+        ld tp, KTP(fp) 
+
+        # ensure that sscratch is set to 0 before we leave trap.s in S mode, as interrupts may be renabled via idle thread or yielding
+        # we want to ensure that interrupts/exceptions are handled through the smode_trap_entry_from_smode 
+
+        csrw sscratch, zero
+
+        # Jump to the umode exception handler or umode interrupt handler 
+        call 1f 
+
+        # Restore registers (Note that after call 1f, interrupts may be enabled) 
+
+        ld      a0, A0(sp)
+        ld      a1, A1(sp)
+        ld      a2, A2(sp)
+        ld      a3, A3(sp)
+        ld      a4, A4(sp)
+        ld      a5, A5(sp)
+        ld      a6, A6(sp)
+        ld      a7, A7(sp)
+        ld      t0, T0(sp)
+        ld      t1, T1(sp)
+        ld      t2, T2(sp)
+        ld      t3, T3(sp)
+        ld      t4, T4(sp)
+        ld      t5, T5(sp)
+        ld      s1, S1(sp)
+        ld      s2, S2(sp)
+        ld      s3, S3(sp)
+        ld      s4, S4(sp)
+        ld      s5, S5(sp)
+        ld      s6, S6(sp)
+        ld      s7, S7(sp)
+        ld      s8, S8(sp)
+        ld      s9, S9(sp)
+        ld      s10, S10(sp)
+        ld      s11, S11(sp)
+        ld      ra, RA(sp)
+        ld      fp, FP(sp)
+        ld      gp, GP(sp) 
+        ld      tp, TP(sp) 
+
+        # must restore previous sstatus with disabled interrupts before we restore sepc to prevent overwriting of sepc 
+
+        ld      t6, SSTATUS(sp)
+        csrw    sstatus, t6
+        ld      t6, SEPC(sp)
+        csrw    sepc, t6
+
+        # Restore /t6/ and /sp/ last
+
+        ld      t6, T6(sp)   
+        csrw    sscratch, sp    # restore sscratch to trapframe 
+        ld      sp, SP(sp)      # restore user stack pointer
+
+        sret    # done!
+
+        # Jump to the expection / interrupt handler
+
+1:      csrr    a0, scause      # a0 contains exception code 
+        mv      a1, sp          # a1 contains to trap frame 
+
+        bgez    a0, handle_umode_exception
+
+        slli    a0, a0, 1       # clear msb to get cause 
+        srli    a0, a0, 1       #
+
+        j handle_umode_interrupt 
 
 
 smode_trap_entry_from_smode:
@@ -272,7 +398,7 @@ trap_frame_jump:
 
         # Restore /sepc/ and late-restore registers
 
-        csrw sscratch, a1
+        csrw    sscratch, a1
 
         ld      t6, SEPC(a0)
         csrw    sepc, t6

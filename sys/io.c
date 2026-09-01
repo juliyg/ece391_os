@@ -4,6 +4,7 @@
 // SPDX-License-identifier: NCSA
 //
 
+#include "console.h"
 #ifdef IO_TRACE
 #define TRACE
 #endif
@@ -512,34 +513,146 @@ static const struct iointf iopipe_reader_intf = {
 //
 
 void create_iopipe(struct io ** wioptr, struct io ** rioptr) {
-    // YOUR CODE HERE
-    return;
+    // allocate iopipe object 
+    kprintf("Inside of create_iopipe\n");
+    struct iopipe * pipe = kcalloc(1, sizeof(struct iopipe)); 
+
+    kprintf("initializing io objects of create_iopipe\n");
+    // initialize generic io objects, and attach dispatch table 
+    pipe->wio = *ioinit(&pipe->wio, &iopipe_writer_intf, 1, 1); 
+    pipe->rio = *ioinit(&pipe->rio, &iopipe_reader_intf, 1, 1); 
+
+    // initialize condition variable and other pipe data
+    condition_init(&pipe->updated, NULL); 
+
+    pipe->wpos = 0; 
+    pipe->rpos = 0; 
+    pipe->wbusy = 0; 
+    *wioptr = &pipe->wio;
+    *rioptr = &pipe->rio;
+
+    // allocate buffer 
+    kprintf("allocated physical buffer\n");
+    pipe->buf = alloc_phys_page(); 
 }
 
 // IOPIPE INTERNAL FUNCTION DEFINITIONS
 //
 
 void iopipe_wio_reclaim(struct io * io) {
-    // YOUR CODE HERE
-    return;
+    struct iopipe* pipe = (void*) io - offsetof(struct iopipe, wio);
+
+    // ready any threads waiting on a writer, but the writer closes instead
+    condition_broadcast(&pipe->updated);
+
+    if(iorefcnt(&pipe->rio) == 0) {
+        iopipe_reclaim(pipe); 
+    } 
 }
 
 void iopipe_rio_reclaim(struct io * io) {
-    // YOUR CODE HERE
-    return;
+    struct iopipe* pipe = (void*) io - offsetof(struct iopipe, rio);
+
+    // ready any threads waiting on a reader, but the writer closes instead
+    condition_broadcast(&pipe->updated);
+
+    if(iorefcnt(&pipe->wio) == 0) {
+        iopipe_reclaim(pipe); 
+    } 
 }
 
+
 long iopipe_write(struct io * io, const void * buf, long buflen) {
-    // YOUR CODE HERE
-    return 0;
+    struct iopipe * pipe = (void*) io - offsetof(struct iopipe, wio); 
+    long bytes_written = 0; 
+
+    // if there are no more readers, stop writing immediately, also if buflen > PAGE_SIZE broken pipe
+    if(iorefcnt(&pipe->rio) == 0) {
+        return -EPIPE; 
+    }
+
+    // write the data into the buffer if buflen fits inside the remaining buffer
+    while(bytes_written < buflen) {
+        // condition wait if the pipe is busy or full, (exclusive access over the buffer) 
+        while(pipe->wbusy || pipe->wpos == PAGE_SIZE) {
+            // we want to check the pipe is broken or not after we reenter, if yes check if we have partially written and return
+            if(iorefcnt(&pipe->rio) == 0) {
+                return bytes_written > 0 ? bytes_written : -EPIPE;
+            }
+            condition_wait(&pipe->updated); 
+        }
+        
+        // set busy flag
+        pipe->wbusy = 1; 
+
+        // copy as much as possible or remaining number of bytes < remaining size 
+        if(buflen - bytes_written <= PAGE_SIZE - pipe->wpos) {
+            long n = buflen - bytes_written; 
+            memcpy(pipe->buf + pipe->wpos, buf + bytes_written, n); 
+            pipe->wpos += n;
+            bytes_written += n; 
+        } else {
+            long n = PAGE_SIZE - pipe->wpos; 
+            memcpy(pipe->buf + pipe->wpos, buf + bytes_written, n); 
+            bytes_written += n; 
+            pipe->wpos += n;
+        }
+
+        // wake up other threads to ready list
+        pipe->wbusy = 0; 
+        condition_broadcast(&pipe->updated); 
+    }
+    
+    return bytes_written;
 }
 
 long iopipe_read(struct io * io, void * buf, long bufsz) {
-    // YOUR CODE HERE
-    return 0;
+    struct iopipe * pipe = (void*) io - offsetof(struct iopipe, rio); 
+    long bytes_read = 0; 
+
+    // if there are no writers and no more bytes to read 
+    if(iorefcnt(&pipe->wio) == 0 && pipe->wpos == 0) {
+        return 0; 
+    }
+
+    // wait for data, and for it to be not busy 
+    while(pipe->wpos == 0 || pipe->wbusy == 1) {
+        // we want to check if the case if a broadcasting writer exited 
+        if(iorefcnt(&pipe->wio) == 0 && pipe->wpos == 0) {
+            return 0; 
+        }
+        condition_wait(&pipe->updated);
+    } 
+
+    pipe->wbusy = 1; 
+
+    int available_bytes = pipe->wpos - pipe->rpos; 
+    if(bufsz >= available_bytes) {
+        // read all available bytes 
+        memcpy(buf, pipe->buf + pipe->rpos, available_bytes); 
+
+        // reset the buffer positions to 0, since we consumed all bytes
+        pipe->wpos = 0;
+        pipe->rpos = 0;
+        bytes_read = available_bytes;
+    } else {
+        // read bufsz bytes 
+        memcpy(buf, pipe->buf + pipe->rpos, bufsz); 
+
+        // increment rpos
+        pipe->rpos += bufsz; 
+        bytes_read += bufsz;
+    }
+
+
+    // ready up other threads 
+    pipe->wbusy = 0; 
+    condition_broadcast(&pipe->updated); 
+
+    return bytes_read; 
 }
 
 void iopipe_reclaim(struct iopipe * p) {
-    // YOUR CODE HERE
-    return;
+    free_phys_page(p->buf); 
+    kfree(p); 
 }

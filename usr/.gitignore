@@ -1,0 +1,7 @@
+*.o
+*.raw
+*.elf 
+progs/*.o
+../util/fs/*.txt
+*.txt
+

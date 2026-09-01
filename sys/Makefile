@@ -13,7 +13,7 @@ UNIFDEF=unifdef
 
 TARGET=qvirt
 
-STUDENT_CP1=1
+STUDENT_CP1=0
 
 OBJS = \
 	board/$(TARGET)/init.o \
@@ -42,8 +42,7 @@ OBJS = \
 	thrasm.o \
 	thread.o \
 	timer.o \
-	trap.o
-
+	trap.o 
 
 
 CFLAGS = -Wall -Werror=implicit-function-declaration -Wno-unused-function
@@ -87,9 +86,12 @@ QEMUOPTS += -machine virt -nographic
 QEMUOPTS += -object rng-random,filename=/dev/urandom,id=rng0
 QEMUOPTS += -device virtio-rng-device,rng=rng0
 QEMUOPTS += -bios bios/osbi181q.bin
+# QEMUOPTS += -serial mon:stdio
+# QEMUOPTS += -serial pty
+QEMUOPTS += -serial pty
+# QEMUOPTS += -serial file:logs.txt
 QEMUOPTS += -serial mon:stdio
-QEMUOPTS += -serial pty
-QEMUOPTS += -serial pty
+QEMUOPTS += -serial file:text.txt
 QEMUOPTS += -device virtio-blk-device,drive=blk0
 QEMUOPTS += -drive file=fs/ngfs.raw,id=blk0,if=none,format=raw,readonly=false
 QEMUOPTS += -device virtio-blk-device,drive=blk1
@@ -118,7 +120,8 @@ run: kernel.elf
 	$(QEMU) $(QEMUOPTS) -m 16M -kernel $<
 
 debug: kernel.elf
-	$(QEMU) $(QEMUOPTS) -m 16M -kernel $< -S -s
+	$(QEMU) $(QEMUOPTS) -m 16M -kernel $< -S -gdb tcp::1235
+# 	$(QEMU) $(QEMUOPTS) -m 16M -kernel $< -S -s
 
 BLOB_OBJCOPY_FLAGS = \
 	--add-section .data.blob=blob.raw \
@@ -127,6 +130,9 @@ BLOB_OBJCOPY_FLAGS = \
 blob.o:
 	echo .end | $(AS) $(ASFLAGS) -o blob.o
 	[ ! -f blob.raw ] || $(OBJCOPY) $(BLOB_OBJCOPY_FLAGS) $@
+
+ngfs.raw:
+	../util/fs/mkfs_ngfs ./fs/ngfs.raw 32M ../usr/bin/* ../usr/games/*
 
 %.o: %.c
 	$(CC) -c -o $@ $(CFLAGS) $<

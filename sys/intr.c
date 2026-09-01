@@ -103,8 +103,8 @@ void handle_smode_interrupt(unsigned int cause) {
 }
 
 void handle_umode_interrupt(unsigned int cause) {
-    // YOUR CODE HERE
-    return;
+    handle_interrupt(cause);
+    yield_running_thread(); 
 }
 
 extern long enable_interrupts(void) {

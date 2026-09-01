@@ -13,7 +13,7 @@
 #endif
 
 #include "thread.h"
-
+#include "console.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -35,6 +35,15 @@
 #ifndef NTHR // maximum number of threads
 #define NTHR 32
 #endif
+
+#ifndef MLFQ_NQ // number of priorities 
+#define MLFQ_NQ 4 
+#endif 
+
+#ifndef MLFQ_NOT_STARTED 
+#define MLFQ_NOT_STARTED UINT32_MAX
+#endif
+
 
 #ifndef SCHED_SLICE_MS // scheduler time slice
 #define SCHED_SLICE_MS 20
@@ -85,6 +94,17 @@ struct thread {
     struct condition child_exit;
 
     // (you may add additional structure members here)
+    unsigned int running_start_tick; 
+    int priority; 
+
+    // following are used for information 
+    int promoted_count;
+    int demoted_count;
+    unsigned int total_run_ticks;
+    unsigned int q0_runs;
+    unsigned int q1_runs;
+    unsigned int q2_runs;
+    unsigned int q3_runs;
 };
 
 // INTERNAL MACRO DEFINITIONS
@@ -134,6 +154,16 @@ static void tlprepend(struct thread_list * l0, struct thread_list * l1);
 
 static void idle_thread_func(void);
 
+// Gets the next running thread 
+static struct thread* mlfq_get_next_thread(void);
+
+// Enqueues the next running thread to its priority 
+static void mlfq_enqueue_thread(struct thread * thread); 
+
+// checks all queues if they are empty or not empty 
+static int mlfq_empty(void); 
+
+
 // IMPORTED QUASI-FUNCTION DECLARATIONS
 // defined in thrasm.s
 //
@@ -156,11 +186,22 @@ extern char _main_stack_anchor[]; // from start.s
 
 static struct thread main_thread = {
     .id = MAIN_TID,
+    .priority = 0, 
     .name = "main",
     .state = THREAD_RUNNING,
+    .running_start_tick = MLFQ_NOT_STARTED,
     .stack_anchor = (void*)_main_stack_anchor,
     .stack_lowest = _main_stack_lowest,
-    .child_exit = { .name = "main_thread.child_exit" }
+    .child_exit = { .name = "main_thread.child_exit" },
+
+    // accounting info 
+    .promoted_count = 0,
+    .demoted_count = 0,
+    .total_run_ticks = 0,
+    .q0_runs = 0,
+    .q1_runs = 0,
+    .q2_runs = 0,
+    .q3_runs = 0
 };
 
 extern char _idle_stack_lowest[]; // from thrasm.s
@@ -169,12 +210,23 @@ extern char _idle_stack_anchor[]; // from thrasm.s
 static struct thread idle_thread = {
     .id = IDLE_TID,
     .name = "idle",
+    .priority = 3,
+    .running_start_tick = MLFQ_NOT_STARTED,
     .state = THREAD_READY,
     .parent = &main_thread,
     .stack_anchor = (void*)_idle_stack_anchor,
     .stack_lowest = _idle_stack_lowest,
     .ctx.sp = _idle_stack_anchor,
-    .ctx.ra = &idle_thread_func
+    .ctx.ra = &idle_thread_func,
+
+    // accounting info
+    .promoted_count = 0,
+    .demoted_count = 0,
+    .total_run_ticks = 0,
+    .q0_runs = 0,
+    .q1_runs = 0,
+    .q2_runs = 0,
+    .q3_runs = 0
 };
 
 static struct thread * thrtab[NTHR] = {
@@ -182,13 +234,14 @@ static struct thread * thrtab[NTHR] = {
     [IDLE_TID] = &idle_thread
 };
 
-static struct thread_list ready_list = {
-    .head = &idle_thread,
-    .tail = &idle_thread
-};
+
+// There are 4 priorities and 4 queues 
+static struct thread_list ready_list[MLFQ_NQ]; 
 
 // EXPORTED THREAD FUNCTION DEFINITIONS
 //
+
+
 
 int running_thread(void) {
     return TP->id;
@@ -202,6 +255,97 @@ void thrmgr_init(void) {
     init_idle_thread();
     set_thread_pointer(&main_thread);
     thrmgr_initialized = 1;
+}
+
+static struct thread* mlfq_get_next_thread(void) {
+    for(int i = 0; i < MLFQ_NQ; i++) {
+        if(!tlempty(&ready_list[i])) {
+            return tlremove(&ready_list[i]); 
+        }
+    }
+    
+    return &idle_thread; 
+}
+
+static void mlfq_enqueue_thread(struct thread * thread) {
+    tlinsert(&ready_list[thread->priority], thread); 
+}
+
+static int mlfq_empty(void) {
+    for(int i = 0; i < MLFQ_NQ; i++) {
+        if(!tlempty(&ready_list[i])) {
+            return 0; 
+        }
+    }
+    return 1; 
+}
+
+void mlfq_boost_priority(void) { 
+    // set all threads priority to the highest (update book keeping)
+    for(int i = 0; i < NTHR - 1; i++) {
+        if(thrtab[i] != NULL) {
+            thrtab[i]->priority = 0; 
+            thrtab[i]->promoted_count++;
+            // we don't want to demote them immediately, fresh start 
+            if(thrtab[i] != TP) {
+                thrtab[i]->running_start_tick = MLFQ_NOT_STARTED; 
+            }
+        }
+        
+    }
+
+    // boost all threads except the idle thread (not actually stored on the wait_list data structure)
+    // move all the ready threads to the highest priority thread_list queue 
+    for(int i = 1; i < MLFQ_NQ; i++) {
+        while(!tlempty(&ready_list[i])) {
+            struct thread * curr = tlremove(&ready_list[i]); 
+            tlinsert(&ready_list[0], curr); 
+        }
+    }
+}
+
+// prints thread info about all threads 
+void display_thread_info(void) {
+    int pie = disable_interrupts();
+
+    kprintf("\n");
+    kprintf("==================================================\n");
+    kprintf("                 MLFQ THREAD INFO\n");
+    kprintf("==================================================\n");
+    kprintf("Q0 = highest priority, Q3 = lowest priority\n\n");
+
+    for (int i = 0; i < NTHR; i++) {
+        struct thread *t = thrtab[i];
+
+        if (t == NULL) {
+            continue;
+        }
+
+        kprintf("tid=%d\n", t->id);
+        kprintf("  state=%s priority=%d ticks=%u\n",
+            thread_state_name(t->state),
+            t->priority,
+            t->total_run_ticks
+        );
+
+        kprintf("  demote=%d promote=%d\n",
+            t->demoted_count,
+            t->promoted_count
+        );
+
+        kprintf("  runs: Q0=%u Q1=%u Q2=%u Q3=%u\n",
+            t->q0_runs,
+            t->q1_runs,
+            t->q2_runs,
+            t->q3_runs
+        );
+
+        kprintf("--------------------------------------------------\n");
+    }
+
+    kprintf("\n");
+
+    restore_interrupts(pie);
 }
 
 int spawn_thread (
@@ -226,7 +370,10 @@ int spawn_thread (
     }
     // allocate and initialize 
     struct thread* new_thread = (struct thread*) kmalloc(sizeof(struct thread));
-    void * stack = kmalloc(HEAP_ALLOC_MAX); 
+
+    // In the kernel direct map, VMA == PMA for RAM pages, so the returned
+    // physical page address can be used directly as a kernel pointer.
+    void * stack = alloc_phys_page(); 
 
     new_thread->id = tid; 
     thrtab[tid] = new_thread;
@@ -234,11 +381,13 @@ int spawn_thread (
     new_thread->name = name; 
     new_thread->stack_lowest = stack; 
     new_thread->list_next = NULL; 
+    new_thread->proc = NULL; 
 
     set_thread_state(new_thread, THREAD_READY);
 
 
     new_thread->stack_anchor = stack + HEAP_ALLOC_MAX - sizeof(struct thread_stack_anchor); 
+    new_thread->stack_anchor->ktp = new_thread; 
     
     // initialize exit condition, so the parent can call join on the child
     condition_init(&new_thread->child_exit, NULL); 
@@ -266,7 +415,22 @@ int spawn_thread (
     
     int pie = disable_interrupts(); 
 
-    tlinsert(&ready_list, new_thread);
+    new_thread->promoted_count = 0;
+    new_thread->demoted_count = 0;
+    new_thread->total_run_ticks = 0;
+    new_thread->q0_runs = 0;
+    new_thread->q1_runs = 0;
+    new_thread->q2_runs = 0;
+    new_thread->q3_runs = 0;
+
+
+    // spawned threads are given priority 0 
+    new_thread->priority = 0; 
+
+    // running thread start time set to -1 until it is scheduled
+    new_thread->running_start_tick = MLFQ_NOT_STARTED; 
+
+    mlfq_enqueue_thread(new_thread); 
     new_thread->parent = TP; 
 
     restore_interrupts(pie); 
@@ -292,21 +456,23 @@ void exit_running_thread(void) {
     set_thread_state(TP, THREAD_EXITED);
 
     // set waiting parents to ready state and append to end of list 
-    condition_broadcast(&(TP->parent)->child_exit);   
+    if(TP->parent != NULL) {
+        condition_broadcast(&(TP->parent)->child_exit);   
+    }
+    
     
     // free the exited chidlren's threads and orphan non-exited child threads
     for(int i = 0; i < NTHR; i++) {
         if(thrtab[i] && thrtab[i]->parent == TP) {
-            
             if(thrtab[i]->state == THREAD_EXITED) {
                 kfree(thrtab[i]);
                 thrtab[i] = NULL; 
             } else {
-                thrtab[i]->parent = NULL; 
+                thrtab[i]->parent = NULL;
             }
-
         }
     }
+
     yield_running_thread(); 
     panic("exited thread was rescheduled");
 }
@@ -314,25 +480,58 @@ void exit_running_thread(void) {
 void yield_running_thread(void) {
     extern void switch_running_thread(struct thread *); // thrasm.s
 
-    trace("%s() in <%s:%d>", __func__, TP->name, TP->id);
+    // trace("%s() in <%s:%d>", __func__, TP->name, TP->id);
 
     // The idle thread is always runnable, and the idle thread only calls
     // yield() if the ready_list is not empty.
-
-    assert (!tlempty(&ready_list));
     
     int pie = disable_interrupts(); 
-
     // move the current running thread to the end of the ready_list 
     // check if the TP is not waiting 
     if(TP->state == THREAD_RUNNING) {
         set_thread_state(TP, THREAD_READY); 
-        tlinsert(&ready_list, TP); 
+
+        // we don't enqueue idle into the wait_list, it is handled separately by mlfq_get_next_thread
+        TP->total_run_ticks += current_timer_tick() - TP->running_start_tick; 
+        if(TP != &idle_thread) {
+            // check if the thread should have it's priority dropped 
+            if(current_timer_tick() - TP->running_start_tick > 1 && TP->priority < MLFQ_NQ - 1 ) {
+                TP->running_start_tick = MLFQ_NOT_STARTED;
+                TP->priority++; 
+                TP->demoted_count++; 
+            }
+
+            mlfq_enqueue_thread(TP); 
+        } else {
+            TP->running_start_tick = MLFQ_NOT_STARTED;
+        }
     } 
     
     // switch to the first in the ready_list 
-    struct thread * queued_thread = tlremove(&ready_list); 
+    struct thread * queued_thread = mlfq_get_next_thread(); 
+
+    // check if the next thread is part of a process 
+    // otherwise we want to switch to the kernel address space (pretty much main memory space)
+    if(queued_thread->proc != NULL) {
+        switch_mspace(queued_thread->proc->mtag); 
+    } else {
+        switch_mspace(main_thread.proc->mtag); 
+    }
     set_thread_state(queued_thread, THREAD_RUNNING); 
+
+    // set the current running time for the running thread if it's priority was previously decreased or it just started
+    // do not set the current running time for threads that have yielded and do not have a cumulative runtime > time slice 
+    if(queued_thread->running_start_tick == MLFQ_NOT_STARTED) {
+        queued_thread->running_start_tick = current_timer_tick(); 
+    } 
+
+    switch(queued_thread->priority) {
+        case 0: queued_thread->q0_runs++; break;
+        case 1: queued_thread->q1_runs++; break;
+        case 2: queued_thread->q2_runs++; break;
+        case 3: queued_thread->q3_runs++; break; 
+    }
+    
     enable_interrupts(); 
     switch_running_thread(queued_thread);
     // will restore interrupts upon this thread regaining control  
@@ -345,12 +544,17 @@ void yield_running_thread(void) {
 void finish_thread_switch(struct thread * susp_thread) {
     // completely free orphans since no parent to call join
     // free the stack only for non-orphans
-    if(susp_thread->state == THREAD_EXITED) {
-        if(!susp_thread->parent) {
-            thrtab[susp_thread->id] = NULL; 
-            kfree(susp_thread); 
-        } 
-        kfree(susp_thread->stack_lowest); 
+    if (susp_thread->state == THREAD_EXITED) {
+        void *stack = susp_thread->stack_lowest;
+        int id = susp_thread->id;
+        int orphan = (susp_thread->parent == NULL);
+
+        if (orphan) {
+            thrtab[id] = NULL;
+            kfree(susp_thread);
+        }
+
+        free_phys_page(stack);
     }
 }
 
@@ -471,14 +675,15 @@ void condition_broadcast(struct condition * cond) {
         restore_interrupts(pie); 
         return; 
     }
+
     // Else there are threads waiting on this condition
     // Add waiting threads to ready list and modify state
-    struct thread* curr = cond->wait_list.head;
-    while(curr != NULL) {
+    while(!tlempty(&cond->wait_list)) {
+        struct thread* curr = tlremove(&cond->wait_list); 
         set_thread_state(curr, THREAD_READY); 
-        curr = curr->list_next; 
+        mlfq_enqueue_thread(curr); 
     }
-    tlappend(&ready_list, &cond->wait_list); 
+
     restore_interrupts(pie); 
 }
 
@@ -568,9 +773,12 @@ void rwlock_release(struct rwlock * rwlk) {
 //
 
 void init_main_thread(void) {
+    // set stack anchor ktp to main_thread location 
+    main_thread.stack_anchor->ktp = &main_thread;
 }
 
 void init_idle_thread(void) {
+    idle_thread.stack_anchor->ktp = &idle_thread;
 }
 
 const char * thread_state_name(enum thread_state state) {
@@ -687,7 +895,7 @@ void idle_thread_func(void) {
     for (;;) {
         // If there are runnable threads, yield to them.
 
-        while (!tlempty(&ready_list))
+        while (!mlfq_empty())
             yield_running_thread();
         
         // No runnable threads. Sleep using the wfi instruction. Note that we
@@ -696,7 +904,7 @@ void idle_thread_func(void) {
         // ISR marks a thread ready before we call the wfi instruction.
 
         disable_interrupts();
-        if (tlempty(&ready_list))
+        if (mlfq_empty())
             asm ("wfi");
         enable_interrupts();
     }

@@ -27,6 +27,8 @@
 #include "thread.h"
 #include "trap.h"
 #include "io.h"
+#include "console.h"
+
 
 // INTERNAL FUNCTION DECLARATIONS
 //
@@ -59,18 +61,133 @@ void procmgr_init(void) {
 }
 
 int process_exec(struct io * exeio, int argc, char ** argv) {
-    // YOUR CODE HERE
-    return 0;
+    // set the trap frame to point to below the stack anchor (this is fine since in the init case we abandon the main stack)
+    // the main.c in the kernel is not returned to so we can clobber the stack 
+    struct trap_frame * trap_frame = running_thread_stack_anchor() - sizeof(struct trap_frame); 
+
+    // allocate physical page (one to one mapping with kernel vma)
+    void * kernel_stack = alloc_phys_page(); 
+    
+    // Make argv[i] point to virtual address space corresponding to data (top of user address space)
+    // Copy data from strings into the kernel page, above the arguments 
+
+    // make sure s-mode can access user mapped virtual memory 
+    csrs_sstatus(RISCV_SSTATUS_SUM); 
+
+    int stksz; 
+    if ( (stksz = build_stack(kernel_stack, argc, argv)) < 0) {
+        free_phys_page(kernel_stack); 
+        iodropref(exeio); 
+        return stksz; 
+    }
+
+    // reset non-global mappings (any current userspace mappings)
+    reset_active_mspace(); 
+
+    // Map the kernel page to the top of the user address space (the argv[i] now point to the copied)
+    map_page(UMEM_END_VMA - PAGE_SIZE, kernel_stack, PTE_W | PTE_R | PTE_U); 
+
+    // entry point for the new executable (cast to function pointer pointer) 
+    if (elf_load(exeio, (void (**) (void)) &trap_frame->sepc) < 0) {
+        process_exit(); 
+    }
+
+    // drop the reference to the executable io object that the kernel has 
+    iodropref(exeio); 
+
+    // setup sp for the user program
+    trap_frame->sp = (void *) (UMEM_END_VMA - stksz); 
+
+    // provide arguments to entrypoint of the process 
+    trap_frame->a0 = argc; 
+    trap_frame->a1 = (long) trap_frame->sp; 
+
+    // set sstatus, so that usermode is reached and interrupts are enabled in usermode
+    trap_frame->sstatus = RISCV_SSTATUS_SPIE | RISCV_SSTATUS_SUM; 
+
+    // Enter entrypoint of the process 
+    trap_frame_jump(trap_frame, trap_frame);
+    return 0; 
 }
 
 int process_fork(const struct trap_frame * tfr) {
-    // YOUR CODE HERE
-    return 0;
+    struct process * curr_proc = current_process(); 
+
+    // allocate memory for the child process metadata 
+    struct process * child_proc = kcalloc(1, sizeof(struct process)); 
+
+    // create child start condition variable
+    struct condition child_start; 
+    condition_init(&child_start, NULL);
+
+    // attempt to spawn a new kernel thread for the process 
+    // fork_func serves as a state restore to the user mode of the child process using the parent's tfr (wrapper around trap_frame_jump)
+    int new_tid = spawn_thread(NULL, (void (*) (void)) &fork_func, &child_start, tfr);  
+    if(new_tid < 0) {
+        kfree(child_proc); 
+        return new_tid; 
+    }
+
+    // initialize child io objects 
+    child_proc->exeio = NULL; 
+    for(int i = 0; i < PROC_IOMAX; i++) {
+        if (curr_proc->iotab[i] == NULL) {
+            child_proc->iotab[i] = NULL;
+            continue; 
+        } else {
+            child_proc->iotab[i] = ioaddref(curr_proc->iotab[i]); 
+        }
+    }
+    
+
+    child_proc->tid = new_tid; 
+    thread_attach_process(new_tid, child_proc);    
+
+    // clone address space and attach process struct 
+    mtag_t new_mtag = clone_active_mspace(); 
+    child_proc->mtag = new_mtag;
+
+    // do not return until the child process begins (prevents parent thread from corrupting stack frame after returning to usermode)
+    condition_wait(&child_start);     
+    
+    // return the tid of the new child_process, this follows the typical syscall path -> restores tfr->a0
+    return new_tid; 
 }
 
+void fork_func(struct condition * done, struct trap_frame * tfr) {
+    // broad cast that the child has entered u-mode 
+    condition_broadcast(done); 
+    tfr->a0 = 0; 
+    tfr->sepc += 4;
+    trap_frame_jump(tfr, running_thread_stack_anchor() - sizeof(struct trap_frame)); 
+}
+
+
 void process_exit(void) {
-    // YOUR CODE HERE
-    return;
+    trace("PROCESS EXIT: tid=%d\n", current_process()->tid);
+    struct process * curr_proc = current_process();
+    // if curr_proc wraps the main kernel thread, writeback cache and shutdown os 
+    if(curr_proc->tid == 0 ) {
+        flush_all_filesys(); 
+        shutdown(); 
+    } else {
+        // drop references to all io objects 
+        for(int i = 0; i < PROC_IOMAX; i++) {
+            if(curr_proc->iotab[i] != NULL) {
+                iodropref(curr_proc->iotab[i]); 
+            }
+        }
+
+        // free address space and mappings of the process 
+        discard_active_mspace();
+
+        // detach process from thread, then free the process metadata
+        thread_attach_process(curr_proc->tid, NULL); 
+        kfree(curr_proc); 
+        curr_proc = NULL;
+        exit_running_thread(); 
+        panic("exit_running_thread returned");
+    }
 }
 
 // INTERNAL FUNCTION DEFINITIONS
@@ -114,7 +231,7 @@ int build_stack(void * stack, int argc, char ** argv) {
     // stack is given by `p - newargv'.
 
     newargv = stack + PAGE_SIZE - stksz;
-    p = (char*)(newargv+argc+1);
+    p = (char*)(newargv+argc+1);                
 
     for (i = 0; i < argc; i++) {
         newargv[i] = (UMEM_END_VMA - PAGE_SIZE) + ((void*)p - (void*)stack);
@@ -125,9 +242,4 @@ int build_stack(void * stack, int argc, char ** argv) {
 
     newargv[argc] = 0;
     return stksz;
-}
-
-void fork_func(struct condition * done, struct trap_frame * tfr) {
-    // YOUR CODE HERE
-    return;
 }

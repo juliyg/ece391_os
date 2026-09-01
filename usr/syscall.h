@@ -123,4 +123,21 @@ extern int _pipe(int * wfdptr, int * rfdptr);
 */
 extern int _iodup(int oldfd, int newfd);
 
+/**
+* @brief Age syscall for AB1043 compliance. Saves the users date of birth on first call and returns age bracket.
+* @param dob unix timestamped date of birth, passed only in the first reference.
+* @return age bracket (0: <13, 1: 13-15, 2: 16-17, 3: 18+)
+*/
+extern int _ab1043(unsigned long long dob);
+
+
+/**
+* @brief Gets thread information 
+*/
+extern int _thrinfo(void); 
+#define AB1043_B1 0
+#define AB1043_B2 1
+#define AB1043_B3 2
+#define AB1043_B4 3
+
 #endif // _SYSCALL_H_

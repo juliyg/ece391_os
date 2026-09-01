@@ -26,5 +26,5 @@
 #define SYSCALL_IODUP 21   // duplicate an fd
 
 #define SYSCALL_AB1043 22  // age verification API
-
+#define SYSCALL_THRINFO 23 // get thread info 
 #endif  // _SCNUM_H_

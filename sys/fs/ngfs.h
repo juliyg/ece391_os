@@ -32,6 +32,7 @@ extern int mount_ngfs(const char * mpname, struct io * bkgio);
 #define NGFS_MAX_FILENAME_LEN       (NGFS_DENSZ - sizeof(uint8_t) - 2*sizeof(uint32_t))
 #define NGFS_FAT_ENTRIES_PER_BLOCK  (NGFS_BLKSZ / sizeof(uint32_t))
 #define NGFS_ROOT_DATA_BLOCK        0
+#define NGFS_DIR_ENTRIES_BLOCK      (NGFS_BLKSZ / NGFS_DENSZ)
 
 #define NGFS_BLOCK_FREE             (uint32_t)0
 #define NGFS_BLOCK_END              (uint32_t)(-1)

@@ -35,6 +35,7 @@
 
 extern char timer_initialized;
 extern unsigned int timer_frequency;
+extern unsigned int bolt_period; 
 extern void timer_init(unsigned int freq);
 
 // Initializes the timer subsystem. The /freq/ argument is the system timer
@@ -126,5 +127,9 @@ extern void sleep_us(unsigned int us);
 //
 // * These functions may switch to another thread context.
 // * These functions may _not_ be called from an ISR.
+
+// helper for function for getting the current timer tick 
+
+extern unsigned int current_timer_tick(void); 
 
 #endif // _TIMER_H_

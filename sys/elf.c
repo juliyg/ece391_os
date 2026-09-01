@@ -117,5 +117,87 @@ struct elf64_phdr {
 
 int elf_load(struct io * io, void (**eptr)(void)) {
     // YOUR CODE HERE
+
+    struct elf64_ehdr ehdr;
+    struct elf64_phdr phdr;
+
+    int res = iofetch(io, 0, &ehdr, sizeof(ehdr));
+    if (res < 0) {
+        return res;
+    }
+
+    if (ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != 'E' || ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F' ) {
+        return -EBADFMT;
+    }
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64 || ehdr.e_ident[EI_DATA] != ELFDATA2LSB || ehdr.e_ident[EI_VERSION] != EV_CURRENT){
+        return -EBADFMT;
+    }
+    if (ehdr.e_type != ET_EXEC){
+        return -EBADFMT;
+    }
+    if (ehdr.e_machine != EM_RISCV){
+        return -EBADFMT;
+    }
+    if (ehdr.e_version != EV_CURRENT){
+        return -EBADFMT;
+    }
+    if (ehdr.e_ehsize != sizeof(ehdr) || ehdr.e_phentsize != sizeof(phdr) || ehdr.e_phnum == 0){
+        return -EBADFMT;
+    }
+    if (ehdr.e_entry < UMEM_START_VMA || ehdr.e_entry >= UMEM_END_VMA){
+        return -EBADFMT;
+    }
+
+    for (int i = 0; i < ehdr.e_phnum; i++){
+        uint64_t offset = ehdr.e_phoff + (uint64_t)i*ehdr.e_phentsize;
+        int res = iofetch(io, offset, &phdr, sizeof(phdr));
+        if (res < 0) {
+            return res;
+        }
+
+        if (phdr.p_type == PT_LOAD) {
+
+            if (phdr.p_filesz > phdr.p_memsz){
+                return -EBADFMT;
+            }
+            if (phdr.p_vaddr == 0 || phdr.p_vaddr < UMEM_START_VMA || phdr.p_vaddr + phdr.p_memsz < UMEM_START_VMA || phdr.p_vaddr >= UMEM_END_VMA || phdr.p_vaddr + phdr.p_memsz >= UMEM_END_VMA){
+                return -EBADFMT;
+            }
+            if (phdr.p_memsz > 0){
+                
+                if (alloc_and_map_range(ROUND_DOWN(phdr.p_vaddr, PAGE_SIZE), ROUND_UP(phdr.p_memsz + phdr.p_vaddr, PAGE_SIZE) - ROUND_DOWN(phdr.p_vaddr, PAGE_SIZE), PTE_R | PTE_W | PTE_U) == NULL){
+                    return -ENOMEM;
+                }
+                int res = iofetch(io, phdr.p_offset, (void *)phdr.p_vaddr, phdr.p_filesz);
+                if (res < 0){
+                    return res;
+                }
+                if (res != phdr.p_filesz){
+                    return -EBADFMT;
+                }
+
+            }
+            if (phdr.p_filesz < phdr.p_memsz){
+                memset((void*)(phdr.p_vaddr+phdr.p_filesz), 0, phdr.p_memsz - phdr.p_filesz);
+            }
+            int flags = 0;
+            if (phdr.p_flags & PF_R){
+                flags |= PTE_R;
+            }
+            if (phdr.p_flags & PF_W){
+                flags |= PTE_W;
+            }
+            if (phdr.p_flags & PF_X){
+                flags |= PTE_X;
+            }     
+            
+            set_range_flags((void*)phdr.p_vaddr, phdr.p_memsz, flags | PTE_U);
+        } 
+        else{
+            continue;
+        }
+    }
+    
+    *eptr = (void (*)(void))ehdr.e_entry;
     return 0;
-}
+    }

@@ -4,6 +4,7 @@
 // SPDX-License-identifier: NCSA
 //
 
+#include "process.h"
 #ifdef TIMER_TRACE
 #define TRACE
 #endif
@@ -19,7 +20,7 @@
 #include "intr.h"
 #include "misc.h"
 #include "string.h"
-
+#include "console.h"
 #include <stddef.h>
 #include <limits.h> // for ULLONG_MAX
 
@@ -28,6 +29,10 @@
 
 #ifndef BOLT_FREQ
 #define BOLT_FREQ 50 // Hz [MP3cp3]
+#endif
+
+#ifndef MLFQ_BOOST_INTERVAL_TICKS 
+#define MLFQ_BOOST_INTERVAL_TICKS 100
 #endif
 
 // INTERNAL TYPE DEFINITIONS
@@ -44,11 +49,12 @@ struct timer_alarm {
 
 char timer_initialized = 0;
 unsigned int timer_frequency = 0;
-
+unsigned int bolt_period = 0;
 
 // INTERNAL GLOBAL VARIABLES
 //
 
+static unsigned int mlfq_boost_tick_count; 
 static struct timer_alarm * sleep_list; // list of pending alarms
 
 
@@ -67,47 +73,48 @@ void timer_init(unsigned int freq) {
     enable_timer_interrupts(); 
     timer_initialized = 1; 
     timer_frequency = freq; 
+    bolt_period = timer_frequency / BOLT_FREQ;
+    mlfq_boost_tick_count = rdtime() / bolt_period; 
     sbi_set_timer(0); 
 }
 
 
 void sleep_until(unsigned long long twake) {
-    struct timer_alarm alarm; 
-    alarm.twake = twake; 
-    condition_init(&alarm.woken, "alarm condition");
-    alarm.next = NULL; 
-
-    // check if the list is empty
+    if (rdtime() >= twake){
+        return;
+    }
+    
     int pie = disable_interrupts();
-    struct timer_alarm *curr = sleep_list; 
-    if(!curr) {
-        sleep_list = &alarm; 
-    } 
+    struct timer_alarm * prev_iter;
+    struct timer_alarm * cur_iter;
 
-    // if the list is not empty, find the spot to insert the alarm
-    struct timer_alarm *prev = curr; 
-    while(curr) {
-        if(alarm.twake < curr->twake) {
-            break;
-        }
-        prev = curr; 
-        curr = curr->next; 
-    }
+    struct timer_alarm cur_alarm;
+    condition_init(&cur_alarm.woken, "alarm_cond");
+    cur_alarm.twake = twake;
+    cur_alarm.next = NULL;
 
-    // case 1: there is one node, and is greater than alarm.twake
-    // case 2: else 
-    if(prev == curr) {
-        sleep_list = &alarm; 
+    if (sleep_list == NULL || twake < sleep_list->twake) { //check case where head is null
+        cur_alarm.next = sleep_list;
+        sleep_list = &cur_alarm;
     } else {
-        alarm.next = curr; 
-        prev->next = &alarm; 
+        prev_iter = sleep_list;
+        cur_iter = sleep_list->next;
+    
+        while (cur_iter != NULL && cur_iter->twake < twake) { // get prev and cur of the given element by order
+            prev_iter = cur_iter;
+            cur_iter = cur_iter->next;
+
+        }
+
+        cur_alarm.next = cur_iter;
+        prev_iter->next = &cur_alarm;
     }
 
-    sbi_set_timer(sleep_list->twake); 
+    sbi_set_timer(sleep_list->twake);
     trace("%s", __func__); 
 
     // must enable timer interrupts after condition otherwise may sleep forever
-    condition_wait(&alarm.woken); 
+    condition_wait(&cur_alarm.woken); 
     restore_interrupts(pie);
 }
 
@@ -138,17 +145,32 @@ void handle_timer_interrupt(void) {
     }
 
     // NULL case for linked list if alarm is null
-    if(!sleep_list) {
-        sbi_set_timer(ULLONG_MAX); 
-        return; 
+    unsigned long long t_next;
+    if(sleep_list != NULL) {
+        t_next = sleep_list->twake; 
     }
-    sbi_set_timer(sleep_list->twake); 
+    else{
+        t_next = ULLONG_MAX;
+    }
+
+
+    unsigned int current_tick = tnow / bolt_period;
+    if(current_tick - mlfq_boost_tick_count > MLFQ_BOOST_INTERVAL_TICKS) {
+        mlfq_boost_tick_count = current_tick;
+        mlfq_boost_priority(); 
+    }
+
+    unsigned long long tbolt = (unsigned long long ) (current_tick + 1) * bolt_period;
+    sbi_set_timer(MIN(t_next, tbolt)); 
     trace("%s", __func__); 
+}
+
+unsigned int current_timer_tick(void) {
+    return rdtime() / bolt_period; 
 }
 
 // INTERNAL FUNCTION DEFINITIONS
 //
-
 
 void enable_timer_interrupts(void) {
     csrs_sie(RISCV_SIE_STIE);

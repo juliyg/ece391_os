@@ -79,6 +79,20 @@ void handle_smode_exception(unsigned int cause, struct trap_frame* tfr) {
 }
 
 void handle_umode_exception(unsigned int cause, struct trap_frame * tfr) {
-    // YOUR CODE HERE
-    return;
+    switch (cause) {
+        case RISCV_SCAUSE_LOAD_PAGE_FAULT:
+        case RISCV_SCAUSE_STORE_PAGE_FAULT:
+            if ( handle_umode_page_fault(tfr, csrr_stval()) <= 0 ) {
+                process_exit(); 
+            }
+            break;
+        case RISCV_SCAUSE_ECALL_FROM_UMODE: 
+            handle_syscall(tfr); 
+
+            // sepc points to the addrress that caused the syscall, not the next instruction
+            // we do NOT want to increment this for page faults
+            tfr->sepc += 4; 
+            break;
+        default: process_exit(); 
+    }
 }

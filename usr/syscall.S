@@ -113,4 +113,20 @@ _iodup:
         ecall
         ret
 
+        .global _ab1043
+        .type   _ab1043, @function
+_ab1043:
+        li      a7, SYSCALL_AB1043
+        ecall
+        ret
+
+_thrinfo: 
+        li      a7, SYSCALL_THRINFO
+        ecall 
+        ret 
+
+        .global _thrinfo
+        .type   _thrinfo, @function
+
+
         .end
