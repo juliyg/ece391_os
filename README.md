@@ -1,3 +1,14 @@
-# ECE 391 OS
+# sp26_ece391_generaltsaoscurrymasala
 
-ECE 391 operating systems project repository.
+## Team Information
+
+- Team Number: `team_70`
+- Team Name: `generaltsaoscurrymasala`
+
+## Members
+
+| NetID | GitHub |
+| --- | --- |
+| `vineeta2` | `vineet798` |
+| `jyli5` | `juliyg` |
+| `NONE` | `NONE` |
